@@ -2,12 +2,20 @@ import argparse
 import logging
 import os
 import sys
-from os.path import exists, basename
+from os.path import exists, basename, isdir
 
 import pyexiv2
 
+def validate_directory(dir):
+    
+    if not exists(dir):
+        logging.error("Path doesn't exist: {}".format(dir))
+        exit(1)
+    if not isdir(dir):
+        logging.error("Path is not a directory: {}".format(dir))
+        exit(1)
 
-def validate_inputs(photo_path, video_path):
+def validate_media(photo_path, video_path):
     """
     Checks if the files provided are valid inputs. Currently the only supported inputs are MP4/MOV and JPEG filetypes.
     Currently it only checks file extensions instead of actually checking file formats via file signature bytes.
@@ -17,15 +25,19 @@ def validate_inputs(photo_path, video_path):
     """
     if not exists(photo_path):
         logging.error("Photo does not exist: {}".format(photo_path))
+        return False
     if not exists(video_path):
         logging.error("Video does not exist: {}".format(video_path))
+        return False
     if not photo_path.lower().endswith(('.jpg', '.jpeg')):
         logging.error("Photo isn't a JPEG: {}".format(photo_path))
+        return False
     if not video_path.lower().endswith(('.mov', '.mp4')):
         logging.error("Video isn't a MOV or MP4: {}".format(photo_path))
+        return False
+    return True
 
-
-def merge_files(photo_path, video_path):
+def merge_files(photo_path, video_path, output_path):
     """Merges the photo and video file together by concatenating the video at the end of the photo. Writes the output to
     a temporary folder.
     :param photo_path: Path to the photo
@@ -33,7 +45,14 @@ def merge_files(photo_path, video_path):
     :return: File name of the merged output file
     """
     logging.info("Merging {} and {}.".format(photo_path, video_path))
-    out_path = "output/{}".format(basename(photo_path))
+    # out_path = os.path.join(output_path, "{}".format(basename(photo_path)))
+
+    # rename output file
+    out_name = basename(photo_path)
+    out_name = os.path.splitext(out_name)[0]
+
+    out_path = os.path.join(output_path, "{}_MP.JPG".format(out_name))
+    
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as outfile, open(photo_path, "rb") as photo, open(video_path, "rb") as video:
         outfile.write(photo.read())
@@ -50,16 +69,24 @@ def add_xmp_metadata(merged_file, offset):
     """
     metadata = pyexiv2.Image(merged_file)
     logging.info("Reading existing metadata from file.")
-    metadata.read_xmp() 
-    logging.info("Found XMP keys: " + str(metadata.read_xmp()))
+    metadata.read_xmp()
+    logging.info("Found XMP keys: " + str(metadata.read_xmp))
     if len(metadata.read_xmp()) > 0:
         logging.warning("Found existing XMP keys. They *may* be affected after this process.")
+
     # (py)exiv2 raises an exception here on basically all my 'test' iPhone 13 photos -- I'm not sure why,
     # but it seems safe to ignore so far. It's logged anyways just in case.
     try:
         pyexiv2.registerNs('http://ns.google.com/photos/1.0/camera/', 'GCamera')
     except KeyError:
         logging.warning("exiv2 detected that the GCamera namespace already exists.".format(merged_file))
+    # metadata['Xmp.GCamera.MicroVideo'] = pyexiv2.XmpTag('Xmp.GCamera.MicroVideo', 1)
+    # metadata['Xmp.GCamera.MicroVideoVersion'] = pyexiv2.XmpTag('Xmp.GCamera.MicroVideoVersion', 1)
+    # metadata['Xmp.GCamera.MicroVideoOffset'] = pyexiv2.XmpTag('Xmp.GCamera.MicroVideoOffset', offset)
+    # metadata['Xmp.GCamera.MicroVideoPresentationTimestampUs'] = pyexiv2.XmpTag(
+    #     'Xmp.GCamera.MicroVideoPresentationTimestampUs',
+    #     1500000)  # in Apple Live Photos, the chosen photo is 1.5s after the start of the video, so 1500000 microseconds
+    # metadata.write()
 
     xmpData = {'Xmp.GCamera.Microvideo': 1, 
                'Xmp.GCamera.MicroVideoVersion': 1, 
@@ -68,16 +95,14 @@ def add_xmp_metadata(merged_file, offset):
     metadata.modify_xmp(xmpData)
 
 
-def convert(photo_path, video_path):
+def convert(photo_path, video_path, output_path):
     """
     Performs the conversion process to mux the files together into a Google Motion Photo.
     :param photo_path: path to the photo to merge
     :param video_path: path to the video to merge
-    :return: None
+    :return: True if conversion was successful, else False
     """
-    validate_inputs(photo_path, video_path)
-
-    merged = merge_files(photo_path, video_path)
+    merged = merge_files(photo_path, video_path, output_path)
     photo_filesize = os.path.getsize(photo_path)
     merged_filesize = os.path.getsize(merged)
 
@@ -86,6 +111,9 @@ def convert(photo_path, video_path):
     offset = merged_filesize - photo_filesize
     add_xmp_metadata(merged, offset)
 
+    # delete original photo and video
+    os.remove(photo_path)
+    os.remove(video_path)
 
 def matching_video(photo_path):
     base = os.path.splitext(photo_path)[0]
@@ -132,15 +160,26 @@ def main(args):
     logging_level = logging.INFO if args.verbose else logging.ERROR
     logging.basicConfig(level=logging_level, stream=sys.stdout)
     logging.info("Enabled verbose logging")
-    if args.dir:
+
+    outdir = args.output if args.output is not None else "output"
+
+    if args.dir is not None:
+        validate_directory(args.dir)
         pairs = process_directory(args.dir, args.recurse)
         for pair in pairs:
-            pass
-            convert(pair[0], pair[1])
+            if validate_media(pair[0], pair[1]):
+                convert(pair[0], pair[1], outdir)
     else:
-        photo_path = args.photo
-        video_path = args.video
-        convert(photo_path, video_path)
+        if args.photo is None and args.video is None:
+            logging.error("Either --dir or --photo and --video are required.")
+            exit(1)
+
+        if bool(args.photo) ^ bool(args.video):
+            logging.error("Both --photo and --video must be provided.")
+            exit(1)
+
+        if validate_media(args.photo, args.video):
+            convert(args.photo, args.video, outdir)
 
 
 if __name__ == '__main__':
@@ -153,4 +192,5 @@ if __name__ == '__main__':
                         action='store_true')
     parser.add_argument('--photo', type=str, help='Path to the JPEG photo to add.')
     parser.add_argument('--video', type=str, help='Path to the MOV video to add.')
+    parser.add_argument('--output', type=str, help='Path to where files should be written out to.')
     main(parser.parse_args())
